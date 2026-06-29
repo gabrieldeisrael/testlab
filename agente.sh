@@ -1,189 +1,251 @@
 #!/usr/bin/env bash
 # agente.sh — roda na VM (guest)
 # Fluxo:
-#   1. Fica escutando na porta vsock
-#   2. Recebe wine67.sh do servidor
-#   3. Recebe sinal RUN
-#   4. Instala wine67.sh, roda os 5 .exe e coleta logs
-#   5. Envia relatório de volta via vsock
+#   1. Escuta vsock, recebe wine67.sh do servidor
+#   2. Recebe sinal RUN:<sha>
+#   3. Para cada .exe em EXE_DIR:
+#      - copia wine67.sh + .exe para um dir isolado
+#      - wine67.sh faz find("$SCRIPT_DIR", "*.exe") → acha exatamente 1 → menu lista [1]
+#      - alimenta "1\n" via pipe para selecionar automaticamente
+#      - captura saída + exit code + duração
+#   4. Monta relatório e envia de volta via vsock
 
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════
 # CONFIGURAÇÃO
 # ══════════════════════════════════════════════════════════════════
-VSOCK_PORT="${VSOCK_PORT:-9967}"           # mesma porta do monitor.sh
+VSOCK_PORT="${VSOCK_PORT:-9967}"
 HOST_CID="${HOST_CID:-2}"                  # CID do host (sempre 2 no KVM/QEMU)
 
-# Os 5 .exe a testar — coloque os arquivos em EXE_DIR antes de rodar
+# Pasta com os .exe a testar — coloque os arquivos aqui antes de rodar
 EXE_DIR="${EXE_DIR:-$HOME/wine67ci/exes}"
 
-# Diretório de trabalho temporário
-WORK_DIR="${WORK_DIR:-/tmp/wine67ci}"
+# Dir de trabalho temporário (recriado a cada ciclo)
+WORK_BASE="${WORK_BASE:-/tmp/wine67ci}"
 
-WINE67_CACHE="$HOME/.cache/wine67"
-WINE67_BIN="$WINE67_CACHE/bin/wine"
+# Timeout por exe: inclui wineboot (1ª vez ~60s) + execução do .exe
+# Na primeira execução wine67.sh também baixa o Wine (~500MB) se não estiver cacheado.
+# O download só acontece uma vez pois vai para ~/.cache/wine67 que persiste entre testes.
+EXE_TIMEOUT="${EXE_TIMEOUT:-180}"
 # ══════════════════════════════════════════════════════════════════
 
-mkdir -p "$WORK_DIR" "$EXE_DIR"
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+die() { echo "[ERRO] $*" >&2; exit 1; }
 
-log()  { echo "[$(date '+%H:%M:%S')] $*"; }
-die()  { echo "[ERRO] $*" >&2; exit 1; }
-
-# ── Verifica dependências ─────────────────────────────────────────
-for cmd in socat bash; do
+for cmd in socat bash timeout; do
     command -v "$cmd" &>/dev/null || die "$cmd não encontrado."
 done
 
-# ── Protocolo vsock (mesmo do monitor.sh) ────────────────────────
+# ── Protocolo vsock: header 10 dígitos + payload ─────────────────
 vsock_recv() {
-    local timeout="${1:-60}"
-    socat -T "$timeout" "VSOCK-LISTEN:${VSOCK_PORT},reuseaddr" - 2>/dev/null | {
-        read -r -n 10 header
+    local tout="${1:-3600}"
+    socat -T "$tout" "VSOCK-LISTEN:${VSOCK_PORT},reuseaddr" - 2>/dev/null | {
+        IFS= read -r -n 10 header
         local size="${header// /}"
-        if [[ -z "$size" || ! "$size" =~ ^[0-9]+$ ]]; then
-            echo ""
-            return
-        fi
+        [[ -z "$size" || ! "$size" =~ ^[0-9]+$ ]] && return
         dd bs=1 count="$size" 2>/dev/null
     }
 }
 
 vsock_send() {
     local content="$1"
-    local size="${#content}"
-    local header
-    header=$(printf '%010d' "$size")
-    printf '%s%s' "$header" "$content" \
+    printf '%010d%s' "${#content}" "$content" \
         | socat - "VSOCK-CONNECT:${HOST_CID}:${VSOCK_PORT}" \
-        || log "Falha ao enviar dados via vsock"
+        || log "⚠ Falha ao enviar relatório via vsock"
 }
 
-# ── Roda um .exe com wine e coleta resultado ──────────────────────
-test_exe() {
-    local exe="$1"
-    local name
-    name=$(basename "$exe")
-    local out_file="$WORK_DIR/out_${name}.log"
-    local status="UNKNOWN"
-    local exit_code=0
+# ── Roda um único .exe via wine67.sh em modo não-interativo ──────
+#
+# wine67.sh é interativo por design (menu, clear, spinner, read).
+# Estratégia para CI:
+#
+#   1. Dir isolado: copiamos wine67.sh + APENAS 1 .exe para um dir temporário.
+#      wine67.sh faz:  find "$SCRIPT_DIR" -name "*.exe"
+#      Como há só 1 .exe, o menu lista exatamente [1] esse arquivo.
+#
+#   2. Alimentamos "1\n" via echo para o read do menu selecionar automaticamente.
+#
+#   3. TERM=dumb suprime o clear e faz o spinner não riscar o terminal.
+#
+#   4. WINE67_CI=1 é exportado caso o script queira detectar modo CI no futuro.
+#
+#   5. O cache do Wine (~/.cache/wine67) é compartilhado — o download/extração
+#      só ocorre na primeira execução, as demais são instantâneas.
+#
+#   6. O prefix por jogo (WINEPREFIX=~/.cache/wine67/prefixes/<nome>) também
+#      persiste entre ciclos, então o wineboot só roda uma vez por .exe novo.
 
-    log "  Testando: $name ..."
+run_exe() {
+    local exe_path="$1"
+    local exe_name
+    exe_name=$(basename "$exe_path")
+    local run_dir="$WORK_BASE/run_${exe_name%.exe}"
 
-    # Timeout de 30s por exe — se crashar ou demorar demais, mata
-    if timeout 30s "$WINE67_BIN" "$exe" > "$out_file" 2>&1; then
-        exit_code=$?
-        status="OK"
+    # Limpa dir isolado do ciclo anterior (se houver)
+    rm -rf "$run_dir"
+    mkdir -p "$run_dir"
+
+    # wine67.sh + somente este .exe no dir → menu vai listar [1] ele
+    cp "$WORK_BASE/wine67.sh" "$run_dir/wine67.sh"
+    chmod +x "$run_dir/wine67.sh"
+    cp "$exe_path" "$run_dir/$exe_name"
+
+    local out_file="$run_dir/output.log"
+    local start_ts exit_code elapsed
+
+    start_ts=$(date +%s)
+
+    # echo "1" → seleciona item [1] do menu interativo do wine67.sh
+    # TERM=dumb  → suprime clear + spinner (sem sequências de escape)
+    # WINE67_CI=1 → flag para o script detectar modo CI (futuro)
+    # DISPLAY     → necessário para Wine inicializar janela; Xvfb na porta :99 é ideal
+    #               se não houver display, o .exe vai crashar imediatamente — isso é
+    #               informação válida: registramos como CRASH(no display)
+    if timeout "$EXE_TIMEOUT" bash -c \
+        "echo '1' | TERM=dumb WINE67_CI=1 DISPLAY=${DISPLAY:-:0} bash '$run_dir/wine67.sh'" \
+        > "$out_file" 2>&1; then
+        exit_code=0
     else
         exit_code=$?
-        if [[ $exit_code -eq 124 ]]; then
-            status="TIMEOUT"
-        else
-            status="CRASH (exit $exit_code)"
-        fi
     fi
 
-    # Captura as últimas linhas de saída como evidência
-    local tail_output
-    tail_output=$(tail -10 "$out_file" 2>/dev/null || echo "(sem saída)")
+    elapsed=$(( $(date +%s) - start_ts ))
 
-    printf '[%s] %s\n' "$status" "$name"
-    printf '  Saída (últimas linhas):\n'
-    printf '  %s\n' "$tail_output"
+    # Remove códigos ANSI e \r que possam ter escapado do TERM=dumb
+    sed -i $'s/\x1b\\[[0-9;]*m//g; s/\r//g' "$out_file" 2>/dev/null || true
+
+    # Classifica resultado
+    local status
+    if   [[ $exit_code -eq 124 ]]; then
+        status="TIMEOUT (>${EXE_TIMEOUT}s)"
+    elif [[ $exit_code -eq 0 ]]; then
+        status="OK"
+    else
+        # Captura última mensagem de erro relevante para o status
+        local last_err
+        last_err=$(grep -iE '(erro|error|❌|falha|fault|crash|segfault)' "$out_file" \
+                   | tail -1 | sed 's/^[[:space:]]*//' || true)
+        status="CRASH (exit ${exit_code}${last_err:+ — ${last_err:0:60}})"
+    fi
+
+    # Evidência: últimas 25 linhas do log
+    local tail_out
+    tail_out=$(tail -25 "$out_file" 2>/dev/null || echo "(sem saída)")
+
+    # Imprime resultado estruturado
+    printf '[%s] %s  (%ds)\n' "$status" "$exe_name" "$elapsed"
+    printf '  Log (últimas linhas):\n'
+    while IFS= read -r line; do
+        printf '    %s\n' "$line"
+    done <<< "$tail_out"
     printf '\n'
+
+    # Limpa dir isolado (o cache do Wine em ~/.cache/wine67 permanece)
+    rm -rf "$run_dir"
+
+    return $exit_code
 }
 
 # ══════════════════════════════════════════════════════════════════
 # LOOP PRINCIPAL
 # ══════════════════════════════════════════════════════════════════
-log "=== wine67ci agente iniciado (escutando vsock porta $VSOCK_PORT) ==="
+log "=== wine67ci agente iniciado (vsock porta $VSOCK_PORT) ==="
+log "    EXE_DIR    : $EXE_DIR"
+log "    EXE_TIMEOUT: ${EXE_TIMEOUT}s por exe"
+log "    HOST_CID   : $HOST_CID"
+mkdir -p "$EXE_DIR" "$WORK_BASE"
 
 while true; do
 
-    # ── Etapa 1: recebe o wine67.sh ───────────────────────────────
-    log "Aguardando wine67.sh do servidor ..."
-    SCRIPT_CONTENT=$(vsock_recv 3600)   # espera até 1h por um novo deploy
+    # ── 1. Recebe wine67.sh ───────────────────────────────────────
+    log "Aguardando wine67.sh do servidor (host CID $HOST_CID → porta $VSOCK_PORT) ..."
+    SCRIPT_CONTENT=$(vsock_recv 3600)   # espera até 1h
 
     if [[ -z "$SCRIPT_CONTENT" ]]; then
-        log "Timeout aguardando script. Reiniciando escuta ..."
+        log "⚠ Timeout/sem dados. Reiniciando escuta ..."
         continue
     fi
 
-    WINE67_SCRIPT="$WORK_DIR/wine67.sh"
-    printf '%s' "$SCRIPT_CONTENT" > "$WINE67_SCRIPT"
-    chmod +x "$WINE67_SCRIPT"
+    # Salva o script recebido
+    printf '%s' "$SCRIPT_CONTENT" > "$WORK_BASE/wine67.sh"
+    chmod +x "$WORK_BASE/wine67.sh"
     log "wine67.sh recebido (${#SCRIPT_CONTENT} bytes)."
 
-    # ── Etapa 2: recebe sinal RUN ─────────────────────────────────
+    # Extrai versão do Wine que o script vai baixar (para o relatório)
+    WINE_VER=$(grep -o 'wine-[0-9][0-9.]*' "$WORK_BASE/wine67.sh" | head -1 || echo "desconhecida")
+
+    # ── 2. Recebe sinal RUN ───────────────────────────────────────
     log "Aguardando sinal RUN ..."
     SIGNAL=$(vsock_recv 30)
 
     if [[ "$SIGNAL" != RUN:* ]]; then
-        log "Sinal inesperado: '$SIGNAL'. Abortando ciclo."
+        log "⚠ Sinal inesperado: '$SIGNAL'. Abortando ciclo."
         continue
     fi
 
     COMMIT_SHA="${SIGNAL#RUN:}"
-    log "▶ Sinal RUN recebido (commit $COMMIT_SHA). Iniciando testes ..."
+    log "▶ RUN recebido (commit $COMMIT_SHA). Iniciando testes ..."
 
-    # ── Etapa 3: instala/atualiza o wine67.sh ────────────────────
+    # ── 3. Lista os .exe (máx 5) ─────────────────────────────────
+    mapfile -t EXE_LIST < <(find "$EXE_DIR" -maxdepth 1 -name '*.exe' | sort | head -5)
+
+    # ── 4. Cabeçalho do relatório ─────────────────────────────────
     REPORT=""
     REPORT+="=== wine67ci — Relatório da VM ===\n"
-    REPORT+="Commit  : $COMMIT_SHA\n"
-    REPORT+="Data    : $(date '+%d/%m/%Y %H:%M:%S')\n"
-    REPORT+="Host    : $(hostname)\n"
-    REPORT+="Distro  : $(grep '^PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'desconhecida')\n"
+    REPORT+="Commit      : $COMMIT_SHA\n"
+    REPORT+="Data        : $(date '+%d/%m/%Y %H:%M:%S')\n"
+    REPORT+="VM hostname : $(hostname)\n"
+    REPORT+="Distro      : $(grep '^PRETTY_NAME' /etc/os-release 2>/dev/null \
+                | cut -d= -f2 | tr -d '"' || echo 'desconhecida')\n"
+    REPORT+="Wine versão : $WINE_VER (fallback do script)\n"
+    REPORT+="Cache Wine  : ${HOME}/.cache/wine67\n"
+    REPORT+="EXEs testados: ${#EXE_LIST[@]}\n"
     REPORT+="==================================\n\n"
 
-    log "Rodando wine67.sh --setup-only ..."
-    SETUP_OUT=$(WINE67_CI=1 bash "$WINE67_SCRIPT" --setup-only 2>&1 || true)
-    REPORT+="── Instalação do Wine ──\n$SETUP_OUT\n\n"
-
-    # Verifica se o binário wine está disponível após instalação
-    if [[ ! -x "$WINE67_BIN" ]]; then
-        REPORT+="[ERRO] Binário wine não encontrado em $WINE67_BIN após instalação.\n"
-        REPORT+="       Testes de .exe abortados.\n"
-        log "❌ wine não instalado. Enviando relatório de falha ..."
+    if [[ ${#EXE_LIST[@]} -eq 0 ]]; then
+        REPORT+="[AVISO] Nenhum .exe encontrado em $EXE_DIR\n"
+        REPORT+="        Coloque os arquivos .exe em $EXE_DIR e reinicie o agente.\n"
+        log "⚠ Nenhum .exe em $EXE_DIR"
         vsock_send "$(printf '%b' "$REPORT")"
         continue
     fi
 
-    REPORT+="[OK] Wine instalado: $("$WINE67_BIN" --version 2>/dev/null || echo 'versão desconhecida')\n\n"
+    # ── 5. Executa cada .exe ──────────────────────────────────────
+    REPORT+="── Testes dos .exe ──\n\n"
+    PASS=0; FAIL=0; TIMEOUT_COUNT=0
 
-    # ── Etapa 4: testa os 5 .exe ─────────────────────────────────
-    REPORT+="── Testes dos .exe ──\n"
+    for exe in "${EXE_LIST[@]}"; do
+        log "  → $(basename "$exe")"
+        result=$(run_exe "$exe" 2>&1) && rc=0 || rc=$?
+        REPORT+="$result\n"
 
-    mapfile -t EXE_LIST < <(find "$EXE_DIR" -maxdepth 1 -name '*.exe' | sort | head -5)
-
-    if [[ ${#EXE_LIST[@]} -eq 0 ]]; then
-        REPORT+="[AVISO] Nenhum .exe encontrado em $EXE_DIR\n"
-        REPORT+="        Coloque os arquivos .exe em $EXE_DIR antes de rodar.\n"
-        log "⚠ Nenhum .exe encontrado."
-    else
-        PASS=0
-        FAIL=0
-        for exe in "${EXE_LIST[@]}"; do
-            result=$(test_exe "$exe")
-            REPORT+="$result\n"
-            if echo "$result" | grep -q '^\[OK\]'; then
-                ((PASS++)) || true
-            else
-                ((FAIL++)) || true
-            fi
-        done
-        REPORT+="\n── Resumo ──\n"
-        REPORT+="PASS : $PASS\n"
-        REPORT+="FAIL : $FAIL\n"
-        REPORT+="TOTAL: $((PASS + FAIL))\n"
-        if [[ $FAIL -eq 0 ]]; then
-            REPORT+="STATUS: ✅ TUDO OK\n"
-        else
-            REPORT+="STATUS: ❌ $FAIL FALHA(S) DETECTADA(S)\n"
+        if   [[ $rc -eq 0   ]]; then ((PASS++))         || true
+        elif [[ $rc -eq 124 ]]; then ((TIMEOUT_COUNT++)) || true; ((FAIL++)) || true
+        else                         ((FAIL++))          || true
         fi
+    done
+
+    # ── 6. Resumo ─────────────────────────────────────────────────
+    REPORT+="── Resumo ──\n"
+    REPORT+="PASS    : $PASS / $((PASS + FAIL))\n"
+    REPORT+="FAIL    : $FAIL / $((PASS + FAIL))\n"
+    REPORT+="TIMEOUT : $TIMEOUT_COUNT\n"
+    if [[ $FAIL -eq 0 ]]; then
+        REPORT+="STATUS  : ✅ TUDO OK\n"
+    else
+        REPORT+="STATUS  : ❌ $FAIL FALHA(S) DETECTADA(S)\n"
     fi
 
-    # ── Etapa 5: envia relatório de volta ─────────────────────────
-    log "Enviando relatório ao servidor ..."
+    # ── 7. Versão real do Wine (se já instalado) ──────────────────
+    WINE_BIN="$HOME/.cache/wine67/bin/wine"
+    if [[ -x "$WINE_BIN" ]]; then
+        REAL_VER=$("$WINE_BIN" --version 2>/dev/null || echo "erro ao obter versão")
+        REPORT+="\nWine instalado: $REAL_VER\n"
+    fi
+
+    # ── 8. Envia relatório ────────────────────────────────────────
+    log "Enviando relatório (PASS=$PASS FAIL=$FAIL TIMEOUT=$TIMEOUT_COUNT) ..."
     vsock_send "$(printf '%b' "$REPORT")"
     log "✅ Relatório enviado. Aguardando próximo ciclo ..."
 
