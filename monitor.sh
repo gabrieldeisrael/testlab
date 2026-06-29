@@ -194,7 +194,12 @@ while true; do
     elif [[ "$CURRENT_SHA" == "$LAST_SHA" ]]; then
         log "Sem novidades. Próximo check em ${POLL_INTERVAL}s."
     else
-        log "🔔 Novo commit detectado: ${CURRENT_SHA:0:8} (anterior: ${LAST_SHA:0:8:-}"
+        # compute a safe shortened previous SHA (or '-' if empty) to avoid invalid parameter expansion
+        prev_short="${LAST_SHA:0:8}"
+        if [[ -z "$prev_short" ]]; then
+            prev_short='-'
+        fi
+        log "🔔 Novo commit detectado: ${CURRENT_SHA:0:8} (anterior: ${prev_short})"
 
         TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
         TMP_SCRIPT=$(mktemp /tmp/wine67_XXXXXX.sh)
