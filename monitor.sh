@@ -176,7 +176,7 @@ while true; do
         log "Sem novidades. Próximo check em ${POLL_INTERVAL}s."
 
     else
-        log "🔔 Novo commit: ${CURRENT_SHA:0:8} (anterior: ${LAST_SHA:0:8:-})"
+        log "🔔 Novo commit: ${CURRENT_SHA:0:8} (anterior: ${LAST_SHA:0:8})"
 
         TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
         TMP_SCRIPT=$(mktemp /tmp/wine67_XXXXXX.sh)
